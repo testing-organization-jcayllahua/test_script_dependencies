@@ -49,14 +49,25 @@ jobs:
             local GROUP=$1
             local ARTIFACT=$2
             local VERSION=$3
+            
+            # Verify that we have a version - if not, log error and skip
+            if [ -z "$VERSION" ]; then
+              echo "ERROR: No patched version found for ${GROUP}:${ARTIFACT}, skipping..."
+              return 1
+            fi
+            
             local PATCH_LINE="force '${GROUP}:${ARTIFACT}:${VERSION}'"
-          
+            
             # Check if we already have a configurations.all block
             if grep -q "configurations.all[[:space:]]*{" build.gradle; then
               # If we have configurations.all, check if we have resolutionStrategy
               if grep -A 10 "configurations.all[[:space:]]*{" build.gradle | grep -q "resolutionStrategy[[:space:]]*{"; then
-                # If we have resolutionStrategy, add the force line inside it if not already there
-                if ! grep -q "$PATCH_LINE" build.gradle; then
+                # Check if the dependency already exists (with or without version)
+                if grep -q "force[[:space:]]*'${GROUP}:${ARTIFACT}:" build.gradle; then
+                  # Replace the existing line with the correct version
+                  sed -i "s|force[[:space:]]*'${GROUP}:${ARTIFACT}:[^']*'|force '${GROUP}:${ARTIFACT}:${VERSION}'|g" build.gradle
+                else
+                  # If we have resolutionStrategy, add the force line inside it
                   awk -v patch="$PATCH_LINE" '
                     /resolutionStrategy[[:space:]]*{/ { print; in_block=1; next }
                     in_block && /^\s*}/ { print "        " patch; in_block=0 }
@@ -92,18 +103,32 @@ jobs:
           
           if [ -f found_in_dependencies.txt ]; then
             while read -r package; do
+              # Extract the patched version, with verification
               PATCHED_VERSION=$(jq -r "select(.securityVulnerability.package.name == \"$package\") | .securityVulnerability.firstPatchedVersion.identifier" vulnerabilities.json)
+              if [ -z "$PATCHED_VERSION" ] || [ "$PATCHED_VERSION" == "null" ]; then
+                echo "WARNING: No patched version found for $package"
+                continue
+              fi
+              
               GROUP=$(echo "$package" | cut -d':' -f1)
               ARTIFACT=$(echo "$package" | cut -d':' -f2)
+              echo "Patching ${GROUP}:${ARTIFACT} to version ${PATCHED_VERSION}"
               patch_gradle "$GROUP" "$ARTIFACT" "$PATCHED_VERSION"
             done < found_in_dependencies.txt
           fi
           
           if [ -f found_in_build_env.txt ]; then
             while read -r package; do
+              # Extract the patched version, with verification
               PATCHED_VERSION=$(jq -r "select(.securityVulnerability.package.name == \"$package\") | .securityVulnerability.firstPatchedVersion.identifier" vulnerabilities.json)
+              if [ -z "$PATCHED_VERSION" ] || [ "$PATCHED_VERSION" == "null" ]; then
+                echo "WARNING: No patched version found for $package"
+                continue
+              fi
+              
               GROUP=$(echo "$package" | cut -d':' -f1)
               ARTIFACT=$(echo "$package" | cut -d':' -f2)
+              echo "Patching ${GROUP}:${ARTIFACT} to version ${PATCHED_VERSION}"
               patch_gradle "$GROUP" "$ARTIFACT" "$PATCHED_VERSION"
             done < found_in_build_env.txt
           fi
