@@ -1,0 +1,44 @@
+name: Fetch Vulnerability Alerts
+
+on:
+  workflow_dispatch: # Allows manual execution of the workflow
+
+jobs:
+  fetch-vulnerability-alerts:
+    runs-on: ubuntu-latest
+
+    steps:
+      # Step 1: Checkout the repository (optional, if you need repo files)
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      # Step 2: Fetch Vulnerability Alerts
+      - name: Run GraphQL Query
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # GitHub-provided token for authentication
+        run: |
+          # Define the GraphQL query
+          QUERY=$(cat <<'EOF'
+          {
+            "query": "query ($org: String = \"\", $repo: String! = \"\") { organization(login: $org) { repository(name: $repo) { name vulnerabilityAlerts(first: 100, states: OPEN) { nodes { dependencyRelationship dependencyScope vulnerableManifestPath securityVulnerability { advisory { ghsaId summary } severity package { name ecosystem } firstPatchedVersion { identifier } vulnerableVersionRange } } } } } }",
+            "variables": {
+              "org": "${{ github.repository_owner }}",
+              "repo": "${{ github.event.repository.name }}"
+            }
+          }
+          EOF
+          )
+
+          # Use curl to send the request to the GraphQL API
+          RESPONSE=$(curl -s -X POST \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$QUERY" \
+            https://api.github.com/graphql)
+
+          # Print the response to the logs
+          echo "GraphQL Response:"
+          echo $RESPONSE
+
+          # Optional: Process the response with jq
+          echo "$RESPONSE" | jq '.data.organization.repository.vulnerabilityAlerts.nodes'
