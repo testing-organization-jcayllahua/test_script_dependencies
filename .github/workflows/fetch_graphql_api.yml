@@ -1,16 +1,12 @@
 name: Classify and Patch Vulnerable Dependencies
-
 on:
   workflow_dispatch:
-
 jobs:
   classify-and-patch:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
       - name: Fetch Vulnerabilities
         id: fetch_vulnerabilities
         env:
@@ -26,22 +22,18 @@ jobs:
           }
           EOF
           )
-
           RESPONSE=$(curl -s -X POST \
             -H "Authorization: Bearer $API_TOKEN" \
             -H "Content-Type: application/json" \
             -d "$QUERY" \
             https://api.github.com/graphql)
-
           echo "$RESPONSE" > vulnerabilities.json
           echo "VULNERABILITIES=$(echo "$RESPONSE" | jq -c '.data.organization.repository.vulnerabilityAlerts.nodes[]')" >> $GITHUB_ENV
-
       - name: Classify Vulnerable Dependencies
         id: classify_dependencies
         run: |
           gradle dependencies > gradle_dependencies.txt
           gradle buildEnvironment > gradle_build_env.txt
-
           echo "${VULNERABILITIES}" | while read -r vulnerability; do
             PACKAGE=$(echo "$vulnerability" | jq -r '.securityVulnerability.package.name')
             if grep -q "$PACKAGE" gradle_dependencies.txt; then
@@ -51,7 +43,6 @@ jobs:
               echo "$PACKAGE" >> found_in_build_env.txt
             fi
           done
-
       - name: Patch Vulnerable Dependencies
         run: |
           patch_gradle() {
@@ -59,9 +50,12 @@ jobs:
             local ARTIFACT=$2
             local VERSION=$3
             local PATCH_LINE="force '${GROUP}:${ARTIFACT}:${VERSION}'"
-      
+          
+            # Check if we already have a configurations.all block
             if grep -q "configurations.all[[:space:]]*{" build.gradle; then
+              # If we have configurations.all, check if we have resolutionStrategy
               if grep -A 10 "configurations.all[[:space:]]*{" build.gradle | grep -q "resolutionStrategy[[:space:]]*{"; then
+                # If we have resolutionStrategy, add the force line inside it if not already there
                 if ! grep -q "$PATCH_LINE" build.gradle; then
                   awk -v patch="$PATCH_LINE" '
                     /resolutionStrategy[[:space:]]*{/ { print; in_block=1; next }
@@ -70,6 +64,7 @@ jobs:
                   ' build.gradle > tmp && mv tmp build.gradle
                 fi
               else
+                # If we have configurations.all but no resolutionStrategy, add it
                 awk -v patch="$PATCH_LINE" '
                   /configurations.all[[:space:]]*{/ {
                     print; print "    resolutionStrategy {"; print "        " patch; print "    }"; next
@@ -78,17 +73,23 @@ jobs:
                 ' build.gradle > tmp && mv tmp build.gradle
               fi
             else
-              {
-                echo "configurations.all {"
-                echo "    resolutionStrategy {"
-                echo "        $PATCH_LINE"
-                echo "    }"
-                echo "}"
-                cat build.gradle
-              } > tmp && mv tmp build.gradle
+              # If we don't have configurations.all, add it before the dependencies block
+              awk -v patch="$PATCH_LINE" '
+                /^dependencies[[:space:]]*{/ {
+                  print "configurations.all {";
+                  print "    resolutionStrategy {";
+                  print "        " patch;
+                  print "    }";
+                  print "}";
+                  print "";
+                  print $0;
+                  next;
+                }
+                { print }
+              ' build.gradle > tmp && mv tmp build.gradle
             fi
           }
-      
+          
           if [ -f found_in_dependencies.txt ]; then
             while read -r package; do
               PATCHED_VERSION=$(jq -r "select(.securityVulnerability.package.name == \"$package\") | .securityVulnerability.firstPatchedVersion.identifier" vulnerabilities.json)
@@ -97,6 +98,15 @@ jobs:
               patch_gradle "$GROUP" "$ARTIFACT" "$PATCHED_VERSION"
             done < found_in_dependencies.txt
           fi
-
+          
+          if [ -f found_in_build_env.txt ]; then
+            while read -r package; do
+              PATCHED_VERSION=$(jq -r "select(.securityVulnerability.package.name == \"$package\") | .securityVulnerability.firstPatchedVersion.identifier" vulnerabilities.json)
+              GROUP=$(echo "$package" | cut -d':' -f1)
+              ARTIFACT=$(echo "$package" | cut -d':' -f2)
+              patch_gradle "$GROUP" "$ARTIFACT" "$PATCHED_VERSION"
+            done < found_in_build_env.txt
+          fi
+      
       - name: Show Final build.gradle
         run: cat build.gradle
