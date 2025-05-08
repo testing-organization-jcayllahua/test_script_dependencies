@@ -31,10 +31,11 @@ jobs:
 
           # Use curl to send the request to the GraphQL API
           RESPONSE=$(curl -s -X POST \
-            -H "Authorization: Bearer $API_TOKEN" \
+            -H "Authorization: Bearer ${{ secrets.API_TOKEN }}" \
             -H "Content-Type: application/json" \
             -d "$QUERY" \
-            https://api.github.com/graphql)
+            https://api.github.com/graphql
+            )
 
           # Print the response to the logs
           echo "GraphQL Response:"
