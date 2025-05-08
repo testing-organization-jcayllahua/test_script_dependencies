@@ -1,18 +1,22 @@
-name: build
+name: Dependency Submission
+
 on:
   push:
-    branches:
-      - main # run the action on your projects default branch
+    branches: ['main']
+
+permissions:
+  contents: write
 
 jobs:
-  build:
-    name: Dependencies
+  dependency-submission:
     runs-on: ubuntu-latest
-    permissions: # The Dependency Submission API requires write permission
-      contents: write
     steps:
-      - name: 'Checkout Repository'
-        uses: actions/checkout@v3
-
-      - name: Run snapshot action
-        uses: mikepenz/gradle-dependency-submission@{latest}
+    - name: Checkout sources
+      uses: actions/checkout@v4
+    - name: Setup Java
+      uses: actions/setup-java@v4
+      with:
+        distribution: 'temurin'
+        java-version: 17
+    - name: Generate and submit dependency graph
+      uses: gradle/actions/dependency-submission@v4
