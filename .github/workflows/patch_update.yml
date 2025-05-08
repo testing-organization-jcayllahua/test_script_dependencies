@@ -58,23 +58,25 @@ jobs:
             local GROUP=$1
             local ARTIFACT=$2
             local VERSION=$3
-
+          
             if [ -z "$VERSION" ] || [ "$VERSION" == "null" ]; then
               echo "WARNING: No patched version found for ${GROUP}:${ARTIFACT}, skipping..."
               return 1
             fi
-
+          
             local PATCH_LINE="force '${GROUP}:${ARTIFACT}:${VERSION}'"
             local DIRECT_DEP_REGEX="['\"]${GROUP}:${ARTIFACT}:[^'\"]*['\"]"
             local NEW_DEP="'${GROUP}:${ARTIFACT}:${VERSION}'"
-
+          
             if grep -qE "$DIRECT_DEP_REGEX" build.gradle; then
               echo "→ Updating direct dependency for ${GROUP}:${ARTIFACT} in dependencies block"
               sed -i -E "s|$DIRECT_DEP_REGEX|$NEW_DEP|g" build.gradle
-            else
-              echo "→ Could not find ${GROUP}:${ARTIFACT} directly in dependencies block. Will patch as transitive instead."
+              echo "✓ Patched as direct dependency only"
+              return 0
             fi
-
+          
+            echo "→ ${GROUP}:${ARTIFACT} not found directly, patching via resolutionStrategy.force"
+          
             if grep -q "configurations.all[[:space:]]*{" build.gradle; then
               if grep -A 10 "configurations.all[[:space:]]*{" build.gradle | grep -q "resolutionStrategy[[:space:]]*{"; then
                 if grep -q "force[[:space:]]*'${GROUP}:${ARTIFACT}:" build.gradle; then
@@ -107,6 +109,7 @@ jobs:
               ' build.gradle > tmp && mv tmp build.gradle
             fi
           }
+
 
           for FILE in found_in_dependencies.txt found_in_build_env.txt; do
             if [ -f "$FILE" ]; then
