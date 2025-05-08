@@ -1,0 +1,133 @@
+name: Classify and Patch Vulnerable Dependencies
+on:
+  workflow_dispatch:
+jobs:
+  classify-and-patch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Fetch Vulnerabilities
+        id: fetch_vulnerabilities
+        env:
+          API_TOKEN: ${{ secrets.API_TOKEN }}
+        run: |
+          # Format GraphQL query with proper escaping
+          QUERY='{
+            "query": "query ($org: String!, $repo: String!) { organization(login: $org) { repository(name: $repo) { vulnerabilityAlerts(first: 100, states: OPEN) { nodes { securityVulnerability { package { name } firstPatchedVersion { identifier } } } } } } }",
+            "variables": {
+              "org": "${{ github.repository_owner }}",
+              "repo": "${{ github.event.repository.name }}"
+            }
+          }'
+          
+          # Store raw response for debugging
+          curl -s -X POST \
+            -H "Authorization: Bearer $API_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$QUERY" \
+            https://api.github.com/graphql > raw_response.json
+
+          # Process response and store vulnerabilities
+          jq '.data.organization.repository.vulnerabilityAlerts.nodes[]' raw_response.json > vulnerabilities.json
+
+      - name: Classify Vulnerable Dependencies
+        id: classify_dependencies
+        run: |
+          # Get Gradle dependencies
+          gradle dependencies > gradle_dependencies.txt
+          gradle buildEnvironment > gradle_build_env.txt
+
+          # Find vulnerable packages in dependencies
+          jq -r '.securityVulnerability.package.name' vulnerabilities.json | sort | uniq > all_vulnerable_packages.txt
+
+          # Classify dependencies
+          while read -r package; do
+            if grep -q "$package" gradle_dependencies.txt; then
+              echo "$package" >> found_in_dependencies.txt
+            fi
+            if grep -q "$package" gradle_build_env.txt; then
+              echo "$package" >> found_in_build_env.txt
+            fi
+          done < all_vulnerable_packages.txt
+
+      - name: Patch Vulnerable Dependencies
+        run: |
+          # Function to safely patch build.gradle
+          patch_gradle() {
+            local GROUP=$1
+            local ARTIFACT=$2
+            local VERSION=$3
+
+            # Verify version exists
+            if [ -z "$VERSION" ] || [ "$VERSION" == "null" ]; then
+              echo "⚠️ No patched version for ${GROUP}:${ARTIFACT}"
+              return
+            fi
+
+            # Create force statement
+            local FORCE_STATEMENT="force '${GROUP}:${ARTIFACT}:${VERSION}'"
+
+            # Check existing configurations
+            if grep -q "resolutionStrategy[[:space:]]*{" build.gradle; then
+              # Update existing resolutionStrategy
+              if grep -q "force .*${GROUP}:${ARTIFACT}" build.gradle; then
+                # Update existing force statement
+                sed -i "s/force '${GROUP}:${ARTIFACT}:[^']*'/${FORCE_STATEMENT}/" build.gradle
+              else
+                # Add new force statement
+                awk -v stmt="$FORCE_STATEMENT" '/resolutionStrategy[[:space:]]*{/ { print; print "        " stmt; next }1' build.gradle > tmp && mv tmp build.gradle
+              fi
+            else
+              # Add new resolutionStrategy block
+              awk -v stmt="$FORCE_STATEMENT" '
+                /^dependencies[[:space:]]*{/ {
+                  print "configurations.all {"
+                  print "    resolutionStrategy {"
+                  print "        " stmt
+                  print "    }"
+                  print "}"
+                  print ""
+                }
+                { print }
+              ' build.gradle > tmp && mv tmp build.gradle
+            fi
+          }
+
+          # Process dependencies
+          process_packages() {
+            local FILE=$1
+            [ -f "$FILE" ] || return
+
+            while read -r package; do
+              # Extract group and artifact
+              GROUP=$(echo "$package" | cut -d: -f1)
+              ARTIFACT=$(echo "$package" | cut -d: -f2)
+
+              # Get the LATEST patched version from all occurrences
+              PATCHED_VERSION=$(jq -r --arg pkg "$package" '
+                .securityVulnerability 
+                | select(.package.name == $pkg) 
+                | .firstPatchedVersion.identifier // "null" 
+                ' vulnerabilities.json | sort -V | tail -n1)
+
+              if [ "$PATCHED_VERSION" != "null" ] && [ -n "$PATCHED_VERSION" ]; then
+                echo "🔧 Patching ${package} to ${PATCHED_VERSION}"
+                patch_gradle "$GROUP" "$ARTIFACT" "$PATCHED_VERSION"
+              else
+                echo "⚠️ No patched version found for ${package}"
+              fi
+            done < "$FILE"
+          }
+
+          # Process both dependency locations
+          process_packages found_in_dependencies.txt
+          process_packages found_in_build_env.txt
+
+      - name: Verify Changes
+        run: |
+          echo "=== Modified build.gradle ==="
+          git diff build.gradle || true
+          echo "=== Current Dependency Tree ==="
+          gradle dependencies --configuration runtimeClasspath
