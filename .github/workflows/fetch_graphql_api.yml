@@ -1,23 +1,21 @@
-name: Fetch Vulnerability Alerts
+name: Classify and Patch Vulnerable Dependencies
 
 on:
-  workflow_dispatch: # Allows manual execution of the workflow
+  workflow_dispatch:
 
 jobs:
-  fetch-vulnerability-alerts:
+  classify-and-patch:
     runs-on: ubuntu-latest
 
     steps:
-      # Step 1: Checkout the repository (optional, if you need repo files)
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
-      # Step 2: Fetch Vulnerability Alerts
-      - name: Run GraphQL Query
+      - name: Fetch Vulnerabilities
+        id: fetch_vulnerabilities
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # GitHub-provided token for authentication
+          API_TOKEN: ${{ secrets.API_TOKEN }}
         run: |
-          # Define the GraphQL query
           QUERY=$(cat <<'EOF'
           {
             "query": "query ($org: String = \"\", $repo: String! = \"\") { organization(login: $org) { repository(name: $repo) { name vulnerabilityAlerts(first: 100, states: OPEN) { nodes { dependencyRelationship dependencyScope vulnerableManifestPath securityVulnerability { advisory { ghsaId summary } severity package { name ecosystem } firstPatchedVersion { identifier } vulnerableVersionRange } } } } } }",
@@ -29,17 +27,131 @@ jobs:
           EOF
           )
 
-          # Use curl to send the request to the GraphQL API
           RESPONSE=$(curl -s -X POST \
-            -H "Authorization: Bearer ${{ secrets.API_TOKEN }}" \
+            -H "Authorization: Bearer $API_TOKEN" \
             -H "Content-Type: application/json" \
             -d "$QUERY" \
-            https://api.github.com/graphql
-            )
+            https://api.github.com/graphql)
 
-          # Print the response to the logs
-          echo "GraphQL Response:"
-          echo $RESPONSE
+          echo "$RESPONSE" > vulnerabilities.json
+          echo "VULNERABILITIES=$(echo "$RESPONSE" | jq -c '.data.organization.repository.vulnerabilityAlerts.nodes[]')" >> $GITHUB_ENV
 
-          # Optional: Process the response with jq
-          echo "$RESPONSE" | jq '.data.organization.repository.vulnerabilityAlerts.nodes'
+      - name: Classify Vulnerable Dependencies
+        id: classify_dependencies
+        run: |
+          gradle dependencies > gradle_dependencies.txt
+          gradle buildEnvironment > gradle_build_env.txt
+
+          echo "${VULNERABILITIES}" | while read -r vulnerability; do
+            PACKAGE=$(echo "$vulnerability" | jq -r '.securityVulnerability.package.name')
+            if grep -q "$PACKAGE" gradle_dependencies.txt; then
+              echo "$PACKAGE" >> found_in_dependencies.txt
+            fi
+            if grep -q "$PACKAGE" gradle_build_env.txt; then
+              echo "$PACKAGE" >> found_in_build_env.txt
+            fi
+          done
+
+      - name: Patch Vulnerable Dependencies
+        run: |
+          patch_gradle() {
+            local GROUP=$1
+            local ARTIFACT=$2
+            local VERSION=$3
+            local PATCH_LINE="force '${GROUP}:${ARTIFACT}:${VERSION}'"
+
+            if grep -q "configurations.all[[:space:]]*{" build.gradle; then
+              if grep -A 10 "configurations.all[[:space:]]*{" build.gradle | grep -q "resolutionStrategy[[:space:]]*{"; then
+                if ! grep -q "$PATCH_LINE" build.gradle; then
+                  awk -v patch="$PATCH_LINE" '
+                    /resolutionStrategy[[:space:]]*{/ { print; in_block=1; next }
+                    in_block && /^\s*}/ { print "        " patch; in_block=0 }
+                    { print }
+                  ' build.gradle > tmp && mv tmp build.gradle
+                fi
+              else
+                awk -v patch="$PATCH_LINE" '
+                  /configurations.all[[:space:]]*{/ {
+                    print; print "    resolutionStrategy {"; print "        " patch; print "    }"; next
+                  }
+                  { print }
+                ' build.gradle > tmp && mv tmp build.gradle
+              fi
+            else
+              {
+                echo "configurations.all {"
+                echo "    resolutionStrategy {"
+                echo "        $PATCH_LINE"
+                echo "    }"
+                echo "}"
+                cat build.gradle
+              } > tmp && mv tmp build.gradle
+            fi
+          }
+
+          patch_plugin() {
+            local GROUP=$1
+            local ARTIFACT=$2
+            local VERSION=$3
+            local PATCH_LINE="force '${GROUP}:${ARTIFACT}:${VERSION}'"
+
+            if grep -q "buildscript[[:space:]]*{" build.gradle; then
+              if grep -A 20 "buildscript[[:space:]]*{" build.gradle | grep -q "configurations.classpath[[:space:]]*{"; then
+                if grep -A 20 "configurations.classpath[[:space:]]*{" build.gradle | grep -q "resolutionStrategy[[:space:]]*{"; then
+                  if ! grep -q "$PATCH_LINE" build.gradle; then
+                    awk -v patch="$PATCH_LINE" '
+                      /resolutionStrategy[[:space:]]*{/ { print; in_block=1; next }
+                      in_block && /^\s*}/ { print "            " patch; in_block=0 }
+                      { print }
+                    ' build.gradle > tmp && mv tmp build.gradle
+                  fi
+                else
+                  awk -v patch="$PATCH_LINE" '
+                    /configurations.classpath[[:space:]]*{/ {
+                      print; print "        resolutionStrategy {"; print "            " patch; print "        }"; next
+                    }
+                    { print }
+                  ' build.gradle > tmp && mv tmp build.gradle
+                fi
+              else
+                awk -v patch="$PATCH_LINE" '
+                  /buildscript[[:space:]]*{/ {
+                    print; print "    configurations.classpath {"; print "        resolutionStrategy {"; print "            " patch; print "        }"; print "    }"; next
+                  }
+                  { print }
+                ' build.gradle > tmp && mv tmp build.gradle
+              fi
+            else
+              {
+                echo "buildscript {"
+                echo "    configurations.classpath {"
+                echo "        resolutionStrategy {"
+                echo "            $PATCH_LINE"
+                echo "        }"
+                echo "    }"
+                echo "}"
+                cat build.gradle
+              } > tmp && mv tmp build.gradle
+            fi
+          }
+
+          if [ -f found_in_dependencies.txt ]; then
+            while read -r package; do
+              PATCHED_VERSION=$(jq -r "select(.securityVulnerability.package.name == \"$package\") | .securityVulnerability.firstPatchedVersion.identifier" vulnerabilities.json)
+              GROUP=$(echo "$package" | cut -d':' -f1)
+              ARTIFACT=$(echo "$package" | cut -d':' -f2)
+              patch_gradle "$GROUP" "$ARTIFACT" "$PATCHED_VERSION"
+            done < found_in_dependencies.txt
+          fi
+
+          if [ -f found_in_build_env.txt ]; then
+            while read -r package; do
+              PATCHED_VERSION=$(jq -r "select(.securityVulnerability.package.name == \"$package\") | .securityVulnerability.firstPatchedVersion.identifier" vulnerabilities.json)
+              GROUP=$(echo "$package" | cut -d':' -f1)
+              ARTIFACT=$(echo "$package" | cut -d':' -f2)
+              patch_plugin "$GROUP" "$ARTIFACT" "$PATCHED_VERSION"
+            done < found_in_build_env.txt
+          fi
+
+      - name: Show Final build.gradle
+        run: cat build.gradle
